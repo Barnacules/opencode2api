@@ -351,21 +351,37 @@ func (c *Client) Chat(ctx context.Context, modelID, text string) (*V2Response, e
 		return nil, fmt.Errorf("get messages: %w", err)
 	}
 	
-	// Parse response - find the LAST assistant message (final state)
+	// Parse response - find the LAST assistant message with finish="stop" (the actual final answer).
+	// The V2 server returns intermediate build agent steps (finish="tool-calls")
+	// AFTER the final answer (finish="stop"). We must use the stop message, not the last assistant msg.
 	var resp V2Response
-	var lastAssistantMsg *ChatMessage
-	for i := range messages {
+	var lastStopMsg *ChatMessage
+	var lastAnyAssistantMsg *ChatMessage
+	for i := len(messages) - 1; i >= 0; i-- {
 		if messages[i].Type == "assistant" {
-			lastAssistantMsg = &messages[i]
+			if messages[i].Finish == "stop" && lastStopMsg == nil {
+				lastStopMsg = &messages[i]
+			}
+			if lastAnyAssistantMsg == nil {
+				lastAnyAssistantMsg = &messages[i]
+			}
 		}
 	}
 	
-	if lastAssistantMsg == nil {
+	// Use the stop message if present, otherwise fall back to the last assistant msg
+	var chosenMsg *ChatMessage
+	if lastStopMsg != nil {
+		chosenMsg = lastStopMsg
+	} else if lastAnyAssistantMsg != nil {
+		chosenMsg = lastAnyAssistantMsg
+	}
+	
+	if chosenMsg == nil {
 		return &V2Response{Finish: "stop"}, nil
 	}
 	
-	// Extract text and tools from the last assistant message's content
-	for _, block := range lastAssistantMsg.Content {
+	// Extract text and tools from the chosen message's content
+	for _, block := range chosenMsg.Content {
 		if block.Type == "text" {
 			resp.Text = block.Text
 		} else if block.Type == "tool" {
@@ -382,11 +398,13 @@ func (c *Client) Chat(ctx context.Context, modelID, text string) (*V2Response, e
 		}
 	}
 	
-	// Set finish reason from the message's finish field
-	if lastAssistantMsg.Finish == "tool-calls" || lastAssistantMsg.Finish == "tool_calls" {
+	// Set finish reason from the chosen message's finish field
+	if chosenMsg.Finish == "tool-calls" || chosenMsg.Finish == "tool_calls" {
 		resp.Finish = "tool_calls"
-	} else if lastAssistantMsg.Fill != "" {
-		resp.Finish = lastAssistantMsg.Fill
+	} else if chosenMsg.Finish == "stop" {
+		resp.Finish = "stop"
+	} else if chosenMsg.Fill != "" {
+		resp.Finish = chosenMsg.Fill
 	} else if len(resp.Tools) > 0 {
 		resp.Finish = "tool_calls"
 	} else {
