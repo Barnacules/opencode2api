@@ -428,7 +428,9 @@ func (g *Gateway) handleV2Inference(w http.ResponseWriter, r *http.Request, exte
 		writeSSEChunk(w, streamID, created, model, nil, map[string]any{"finish_reason": finishReason}, true)
 		
 		w.Write([]byte("data: [DONE]\n\n"))
-		w.Write([]byte("data: [DONE]\n\n"))
+		if flusher, ok := w.(http.Flusher); ok {
+			flusher.Flush()
+		}
 		
 		return
 	}
@@ -511,14 +513,17 @@ func writeSSEChunk(w http.ResponseWriter, streamID string, created int64, model 
 func writeSSEToolCall(w http.ResponseWriter, streamID string, created int64, model string, toolCall map[string]any, isLast bool) {
 	toolCalls := []any{toolCall}
 	choice := map[string]any{
-		"index":         0,
-		"delta":         map[string]any{"tool_calls": toolCalls},
-		"finish_reason": map[string]any{"stop": isLast},
+		"index": 0,
+		"delta": map[string]any{"tool_calls": toolCalls},
+	}
+	if isLast {
+		choice["finish_reason"] = "stop"
 	}
 	writeSSEData(w, streamID, created, model, choice)
 }
 
-// writeSSEData writes a complete SSE data line.
+// writeSSEData writes a complete SSE data line and flushes so the client
+// receives chunks immediately (not buffered into a single giant block).
 func writeSSEData(w http.ResponseWriter, streamID string, created int64, model string, choice map[string]any) {
 	chunk := map[string]any{
 		"id":      streamID,
@@ -528,6 +533,9 @@ func writeSSEData(w http.ResponseWriter, streamID string, created int64, model s
 		"choices": []any{choice},
 	}
 	w.Write([]byte(fmt.Sprintf("data: %s\n\n", jsonMarshal(chunk))))
+	if flusher, ok := w.(http.Flusher); ok {
+		flusher.Flush()
+	}
 }
 
 // jsonMarshal marshals a value to JSON and returns the bytes.
