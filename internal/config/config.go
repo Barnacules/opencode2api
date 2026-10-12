@@ -15,6 +15,15 @@ import (
 	wire "opencode2api/internal/protocol"
 )
 
+// V2ServerConfig holds configuration for an OpenCode V2 server instance.
+// The V2 server provides session-based access to OpenCode models including
+// free models that are blocked on the direct Zen API.
+type V2ServerConfig struct {
+	URL               string `json:"url"`                // V2 server URL (e.g., http://127.0.0.1:49374)
+	Password          string `json:"password,omitempty"` // V2 server password from "opencode service get password"
+	DisableBuildAgent bool   `json:"disable_build_agent"` // Prevents tool execution on server side
+}
+
 type Config struct {
 	Rotation          RotationConfig               `json:"rotation"`
 	Listen            string                       `json:"listen"`
@@ -22,6 +31,7 @@ type Config struct {
 	ServerKeyMetadata map[string]ServerKeyMetadata `json:"server_key_metadata,omitempty"`
 	ZenKeys           []string                     `json:"zen_keys"`
 	GoKeys            []string                     `json:"go_keys"`
+	V2Servers         []V2ServerConfig             `json:"v2_servers"` // V2 servers for free model access
 	Anonymous         bool                         `json:"anonymous"`
 	Proxies           []string                     `json:"proxies"`
 	ProxyFile         string                       `json:"proxyfile"`
@@ -239,6 +249,16 @@ func Normalize(path string, cfg Config) (Config, error) {
 		case "http", "https", "socks5", "socks5h":
 		default:
 			return Config{}, fmt.Errorf("unsupported proxy scheme %q", u.Scheme)
+		}
+	}
+	// Validate V2 server configurations
+	for i, v2 := range cfg.V2Servers {
+		if v2.URL == "" {
+			return Config{}, fmt.Errorf("v2_servers[%d].url must not be empty", i)
+		}
+		u, err := url.Parse(v2.URL)
+		if err != nil || u.Host == "" {
+			return Config{}, fmt.Errorf("v2_servers[%d].url must be a valid URL: %w", i, err)
 		}
 	}
 	for model, protocol := range cfg.Models.Protocols {

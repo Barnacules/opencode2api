@@ -21,6 +21,7 @@ import (
 	wire "opencode2api/internal/protocol"
 	"opencode2api/internal/rotation"
 	"opencode2api/internal/telemetry"
+	"opencode2api/internal/v2"
 )
 
 const maxRequestBody = 32 << 20
@@ -38,6 +39,7 @@ type Gateway struct {
 	catalog      *models.Catalog
 	monitor      *telemetry.Monitor
 	availability *models.AvailabilityStore
+	v2Clients    []*v2.Client // V2 servers for free model access
 }
 
 func New(cfg config.Config, logger *slog.Logger, monitor *telemetry.Monitor) (*Gateway, error) {
@@ -61,6 +63,15 @@ func New(cfg config.Config, logger *slog.Logger, monitor *telemetry.Monitor) (*G
 	}
 	catalog := models.NewCatalog(cfg.Prefer, cfg.Models.Protocols)
 	catalog.SetRefreshInterval(time.Duration(cfg.Models.RefreshSeconds) * time.Second)
+	
+	// Initialize V2 clients for free model access
+	var v2Clients []*v2.Client
+	for _, v2cfg := range cfg.V2Servers {
+		client := v2.New(v2cfg.URL, v2cfg.Password, v2cfg.DisableBuildAgent)
+		v2Clients = append(v2Clients, client)
+		logger.Info("configured v2 server", "component", "gateway", "event", "v2_server_configured", "url", v2cfg.URL, "disable_build_agent", v2cfg.DisableBuildAgent)
+	}
+	
 	return &Gateway{
 		cfg:        cfg,
 		rotation:   rotationManager,
@@ -71,6 +82,7 @@ func New(cfg config.Config, logger *slog.Logger, monitor *telemetry.Monitor) (*G
 		anonymous:  newAnonymousPool(cfg.Anonymous, transports, cooldown),
 		catalog:    catalog,
 		monitor:    monitor,
+		v2Clients:  v2Clients,
 	}, nil
 }
 
@@ -151,6 +163,24 @@ func (g *Gateway) handleInference(external wire.Protocol) http.HandlerFunc {
 		}
 		if err != nil {
 			wire.WriteError(w, external, http.StatusBadRequest, err.Error(), "invalid_request_error", "model")
+			return
+		}
+		
+		// Check if this is a free model that should be routed through V2
+		if g.catalog.IsFreeModel(model) && len(g.v2Clients) > 0 {
+			ids := identity.DeriveRequestIDs(r, payload)
+			if meta != nil {
+				meta.Request = ids.Request
+				meta.Tier = "v2"
+				meta.Protocol = external
+			}
+			started := time.Now()
+			g.handleV2Inference(w, r, external, body, payload, ids)
+			duration := time.Since(started)
+			if meta != nil {
+				meta.Via = "v2"
+			}
+			g.logger.Info("v2 free model inference completed", "component", "gateway", "event", "v2_inference_completed", "request_id", ids.Request, "model", model, "duration_ms", duration.Milliseconds())
 			return
 		}
 		if meta != nil {
@@ -276,6 +306,234 @@ func (g *Gateway) handleInference(external wire.Protocol) http.HandlerFunc {
 		w.WriteHeader(resp.StatusCode)
 		_, _ = w.Write(responseBody)
 	}
+}
+
+// handleV2Inference routes free model requests through the V2 server with disableBuildAgent
+// to prevent tool execution on the proxy server. Tool calls are extracted and forwarded
+// to the client so they can be handled where they belong.
+func (g *Gateway) handleV2Inference(w http.ResponseWriter, r *http.Request, external wire.Protocol, body []byte, input map[string]any, ids identity.RequestIDs) {
+	model := jsonutil.StringAt(input, "model")
+	stream := jsonutil.BoolAt(input, "stream")
+	
+	if len(g.v2Clients) == 0 {
+		wire.WriteError(w, external, http.StatusServiceUnavailable, "no V2 servers configured for free model access", "v2_not_configured", ids.Request)
+		return
+	}
+	
+	// Use the first configured V2 client
+	v2Client := g.v2Clients[0]
+	
+	// Build the prompt from messages
+	var promptBuilder strings.Builder
+	if messages, ok := input["messages"].([]any); ok {
+		for _, rawMsg := range messages {
+			if msg, ok := rawMsg.(map[string]any); ok {
+				role := jsonutil.StringAt(msg, "role")
+				content := jsonutil.StringAt(msg, "content")
+				if content != "" {
+					if role == "system" {
+						promptBuilder.WriteString("System: " + content + "\n\n")
+					} else if role == "user" {
+						promptBuilder.WriteString("User: " + content + "\n\n")
+					} else if role == "assistant" {
+						promptBuilder.WriteString("Assistant: " + content + "\n\n")
+					}
+				}
+			}
+		}
+	} else {
+		// If no messages array, use instructions (Responses protocol)
+		promptBuilder.WriteString(jsonutil.StringAt(input, "instructions") + "\n")
+	}
+	prompt := strings.TrimSpace(promptBuilder.String())
+	if prompt == "" {
+		prompt = jsonutil.StringAt(input, "input") // fallback for Responses protocol
+	}
+	
+	if prompt == "" {
+		wire.WriteError(w, external, http.StatusBadRequest, "no prompt content provided", "invalid_request_error", ids.Request)
+		return
+	}
+	
+	// Send request through V2 server
+	v2Ctx, v2Cancel := context.WithTimeout(r.Context(), time.Duration(g.cfg.Retry.TimeoutSeconds)*time.Second)
+	defer v2Cancel()
+	
+	v2Resp, err := v2Client.Chat(v2Ctx, model, prompt)
+	if err != nil {
+		g.logger.Error("v2 inference failed", "component", "gateway", "event", "v2_inference_error", "request_id", ids.Request, "model", model, "error", err)
+		wire.WriteError(w, external, http.StatusBadGateway, "V2 server request failed", "v2_error", ids.Request)
+		return
+	}
+	
+	// Build the response
+	var response map[string]any
+	
+	if stream {
+		// Stream response - send SSE chunks
+		w.Header().Set("Content-Type", "text/event-stream; charset=utf-8")
+		w.Header().Set("Cache-Control", "no-cache")
+		w.Header().Set("X-Accel-Buffering", "no")
+		w.WriteHeader(http.StatusOK)
+		
+		created := time.Now().Unix()
+		streamID := fmt.Sprintf("chatcmpl-%s", ids.Request)
+		
+		// Initial chunk with role
+		writeSSEChunk(w, streamID, created, model, map[string]any{"role": "assistant"}, map[string]any{"finish_reason": nil}, false)
+		
+		// Stream text content
+		if v2Resp.Text != "" {
+			// Chunk the text for streaming (20 chars per chunk)
+			for i := 0; i < len(v2Resp.Text); i += 20 {
+				end := i + 20
+				if end > len(v2Resp.Text) {
+					end = len(v2Resp.Text)
+				}
+				chunk := v2Resp.Text[i:end]
+				isLast := end >= len(v2Resp.Text)
+				
+				// If no tools present, last text chunk signals stop
+				var finishReason map[string]any
+				if !isLast || len(v2Resp.Tools) > 0 {
+					finishReason = nil
+				} else {
+					finishReason = map[string]any{"finish_reason": "stop"}
+				}
+				
+				writeSSEChunk(w, streamID, created, model, map[string]any{"content": chunk}, finishReason, isLast)
+			}
+		}
+		
+		// Stream tool calls if present
+		if len(v2Resp.Tools) > 0 {
+			for _, tool := range v2Resp.Tools {
+				toolCall := map[string]any{
+					"id":   tool.ID,
+					"type": "function",
+					"function": map[string]any{
+						"name":      tool.Function.Name,
+						"arguments": string(tool.Function.Arguments),
+					},
+				}
+				writeSSEToolCall(w, streamID, created, model, toolCall, false)
+			}
+		}
+		
+		// Final chunk
+		finishReason := "stop"
+		if v2Resp.Finish == "tool_calls" {
+			finishReason = "tool_calls"
+		}
+		writeSSEChunk(w, streamID, created, model, nil, map[string]any{"finish_reason": finishReason}, true)
+		
+		w.Write([]byte("data: [DONE]\n\n"))
+		w.Write([]byte("data: [DONE]\n\n"))
+		
+		return
+	}
+	
+	// Non-streaming response
+	response = map[string]any{
+		"id":      fmt.Sprintf("chatcmpl-%s", ids.Request),
+		"object":  "chat.completion",
+		"created": time.Now().Unix(),
+		"model":   model,
+		"choices": []any{},
+	}
+	
+	// Add content or tool_calls (never both — OpenAI/OpenCode expects one or the other)
+	if v2Resp.Finish == "tool_calls" && len(v2Resp.Tools) > 0 {
+		toolCalls := make([]any, 0, len(v2Resp.Tools))
+		for _, tool := range v2Resp.Tools {
+			toolCalls = append(toolCalls, map[string]any{
+				"id":   tool.ID,
+				"type": "function",
+				"function": map[string]any{
+					"name":      tool.Function.Name,
+					"arguments": string(tool.Function.Arguments),
+				},
+			})
+		}
+		response["choices"] = []any{
+			map[string]any{
+				"index": 0,
+				"message": map[string]any{
+					"role":        "assistant",
+					"content":     nil,
+					"tool_calls":  toolCalls,
+					"finish_reason": "tool_calls",
+				},
+			},
+		}
+	} else if v2Resp.Text != "" {
+		response["choices"] = []any{
+			map[string]any{
+				"index": 0,
+				"message": map[string]any{
+					"role":        "assistant",
+					"content":     v2Resp.Text,
+					"finish_reason": "stop",
+				},
+			},
+		}
+	} else {
+		response["choices"] = []any{
+			map[string]any{
+				"index": 0,
+				"message": map[string]any{
+					"role":       "assistant",
+					"content":    "",
+					"finish_reason": "stop",
+				},
+			},
+		}
+	}
+	
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	w.Write(jsonMarshal(response))
+}
+
+// writeSSEChunk writes a single SSE chunk for streaming responses.
+func writeSSEChunk(w http.ResponseWriter, streamID string, created int64, model string, delta map[string]any, finishReason map[string]any, isLast bool) {
+	choice := map[string]any{
+		"index":  0,
+		"delta":  delta,
+	}
+	if finishReason != nil {
+		choice["finish_reason"] = finishReason["finish_reason"]
+	}
+	writeSSEData(w, streamID, created, model, choice)
+}
+
+// writeSSEToolCall writes an SSE chunk containing tool calls.
+func writeSSEToolCall(w http.ResponseWriter, streamID string, created int64, model string, toolCall map[string]any, isLast bool) {
+	toolCalls := []any{toolCall}
+	choice := map[string]any{
+		"index":         0,
+		"delta":         map[string]any{"tool_calls": toolCalls},
+		"finish_reason": map[string]any{"stop": isLast},
+	}
+	writeSSEData(w, streamID, created, model, choice)
+}
+
+// writeSSEData writes a complete SSE data line.
+func writeSSEData(w http.ResponseWriter, streamID string, created int64, model string, choice map[string]any) {
+	chunk := map[string]any{
+		"id":      streamID,
+		"object":  "chat.completion.chunk",
+		"created": created,
+		"model":   model,
+		"choices": []any{choice},
+	}
+	w.Write([]byte(fmt.Sprintf("data: %s\n\n", jsonMarshal(chunk))))
+}
+
+// jsonMarshal marshals a value to JSON and returns the bytes.
+func jsonMarshal(v any) []byte {
+	b, _ := json.Marshal(v)
+	return b
 }
 
 // handleSystemOne serves System One decision requests on their own endpoint.

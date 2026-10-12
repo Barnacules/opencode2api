@@ -1,6 +1,6 @@
 # opencode2api
 
-[English](README.md) | [简体中文](README.zh-CN.md)
+[English](README.md)
 
 A Go gateway for **OpenCode Zen and Zen Go**. It exposes Chat Completions, Responses, and Anthropic Messages endpoints, translates between their native protocols, and manages upstream keys and proxies.
 
@@ -20,7 +20,7 @@ The executable includes the WebUI. Running the service requires no Node.js runti
 - Local API key creation, naming, enabling, disabling, and deletion with immediate updates.
 - Sticky `sota` / `sweet` model groups with ordering, failure fallback, streaming protection, and persisted state.
 
-See the [management console guide (Chinese)](docs/management.zh-CN.md) for the new pages and configuration.
+See the [management console guide](docs/management.md) for the new pages and configuration.
 
 ## Quick start
 

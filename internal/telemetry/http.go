@@ -35,6 +35,8 @@ type RequestMeta struct {
 	UsageReported  bool
 	AttemptOutcome string
 	Outcome        string
+	// Via indicates the routing method (e.g., "v2" for V2 server, "zen" for direct Zen API)
+	Via string
 }
 
 type requestMetaKey struct{}

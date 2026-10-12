@@ -1,5 +1,5 @@
 <!doctype html>
-<html lang="zh-CN">
+<html lang="en">
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width,initial-scale=1" />
@@ -12,8 +12,8 @@
         <div class="manual-mark"><i>O2</i> OPENCODE GATEWAY</div>
         <div>
           <div class="eyebrow">Operator field manual / 2026</div>
-          <h1>把协议、路由与运行状态放在一张桌面上。</h1>
-          <p>一个无外部前端依赖的本地控制面。配置、检查、接入，然后让 Gateway 保持可解释。</p>
+          <h1>All protocols, routing, and runtime state on one dashboard.</h1>
+          <p>A self-contained control plane with no external frontend dependencies. Configure, inspect, connect, and keep the Gateway explainable.</p>
         </div>
         <div class="mono">CHAT · RESPONSES · ANTHROPIC</div>
       </div>
@@ -45,29 +45,29 @@
         </div>
         <nav class="nav">
           <button data-page="overview" class="active">
-            <span class="nav-no">01</span><span>运行桌面</span>
+            <span class="nav-no">01</span><span>Dashboard</span>
           </button>
-          <button data-page="guide"><span class="nav-no">02</span><span>首次运行</span></button>
-          <button data-page="access"><span class="nav-no">03</span><span>接入手册</span></button>
-          <button data-page="usage"><span class="nav-no">04</span><span>Token 用量</span></button>
+          <button data-page="guide"><span class="nav-no">02</span><span>First Run</span></button>
+          <button data-page="access"><span class="nav-no">03</span><span>Access Guide</span></button>
+          <button data-page="usage"><span class="nav-no">04</span><span>Token Usage</span></button>
           <button data-page="playground">
             <span class="nav-no">05</span><span>Playground</span>
           </button>
           <button data-page="diagnostics">
-            <span class="nav-no">06</span><span>路由诊断</span>
+            <span class="nav-no">06</span><span>Routing Diagnostics</span>
           </button>
-          <button data-page="config"><span class="nav-no">07</span><span>配置中心</span></button>
-          <button data-page="logs"><span class="nav-no">08</span><span>事件日志</span></button>
-          <button data-page="account"><span class="nav-no">09</span><span>账号安全</span></button>
+          <button data-page="config"><span class="nav-no">07</span><span>Config Center</span></button>
+          <button data-page="logs"><span class="nav-no">08</span><span>Event Logs</span></button>
+          <button data-page="account"><span class="nav-no">09</span><span>Account Security</span></button>
           <button data-page="model-quotas">
-            <span class="nav-no">10</span><span>模型与额度</span>
+            <span class="nav-no">10</span><span>Models &amp; Quotas</span>
           </button>
           <button data-page="api-keys">
-            <span class="nav-no">11</span><span>API Key 管理</span>
+            <span class="nav-no">11</span><span>API Key Management</span>
           </button>
-          <button data-page="rotation"><span class="nav-no">12</span><span>模型轮转</span></button>
+          <button data-page="rotation"><span class="nav-no">12</span><span>Model Rotation</span></button>
           <button data-page="availability">
-            <span class="nav-no">13</span><span>免费模型可用性</span>
+            <span class="nav-no">13</span><span>Free Model Availability</span>
           </button>
         </nav>
         <div class="sidebar-foot">
@@ -83,8 +83,8 @@
             <div class="subtitle" id="page-sub">最近一小时、进程累计与当前资源状态。</div>
           </div>
           <div class="toolbar">
-            <button id="refresh-now" class="ghost">立即刷新</button
-            ><button id="logout" class="ghost">退出</button>
+            <button id="refresh-now" class="ghost">Refresh Now</button
+            ><button id="logout" class="ghost">Log out</button>
           </div>
         </header>
         <div id="restart-notice" class="notice hidden"></div>
