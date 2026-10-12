@@ -147,6 +147,7 @@ func (m *RuntimeManager) start(runtime *gatewayRuntime) {
 	runtime.cancel = cancel
 	runtime.gateway.StartProxyHealthChecks(runtimeCtx)
 	runtime.gateway.StartModelRefresh(runtimeCtx)
+	runtime.gateway.StartGC()
 }
 
 func (m *RuntimeManager) Handler() http.Handler {

@@ -29,17 +29,19 @@ const maxRequestBody = 32 << 20
 const anonymousZenKey = "public"
 
 type Gateway struct {
-	rotation     *rotation.Manager
-	cfg          config.Config
-	logger       *slog.Logger
-	transports   *transportPool
-	zenNodes     *nodePool
-	goNodes      *nodePool
-	anonymous    *anonymousPool
-	catalog      *models.Catalog
-	monitor      *telemetry.Monitor
-	availability *models.AvailabilityStore
-	v2Clients    []*v2.Client // V2 servers for free model access
+	rotation      *rotation.Manager
+	cfg           config.Config
+	logger        *slog.Logger
+	transports    *transportPool
+	zenNodes      *nodePool
+	goNodes       *nodePool
+	anonymous     *anonymousPool
+	catalog       *models.Catalog
+	monitor       *telemetry.Monitor
+	availability  *models.AvailabilityStore
+	v2Clients     []*v2.Client        // V2 servers for free model access
+	v2Sessions    *v2SessionStore     // session store for multi-turn tool-calling
+	v2SessionDone chan struct{}       // signal to stop GC goroutine
 }
 
 func New(cfg config.Config, logger *slog.Logger, monitor *telemetry.Monitor) (*Gateway, error) {
@@ -73,17 +75,25 @@ func New(cfg config.Config, logger *slog.Logger, monitor *telemetry.Monitor) (*G
 	}
 	
 	return &Gateway{
-		cfg:        cfg,
-		rotation:   rotationManager,
-		logger:     logger,
-		transports: transports,
-		zenNodes:   zenNodes,
-		goNodes:    goNodes,
-		anonymous:  newAnonymousPool(cfg.Anonymous, transports, cooldown),
-		catalog:    catalog,
-		monitor:    monitor,
-		v2Clients:  v2Clients,
+		cfg:           cfg,
+		rotation:      rotationManager,
+		logger:        logger,
+		transports:    transports,
+		zenNodes:      zenNodes,
+		goNodes:       goNodes,
+		anonymous:     newAnonymousPool(cfg.Anonymous, transports, cooldown),
+		catalog:       catalog,
+		monitor:       monitor,
+		v2Clients:     v2Clients,
+		v2Sessions:    newV2SessionStore(5 * time.Minute),
+		v2SessionDone: make(chan struct{}),
 	}, nil
+}
+
+// StartGC starts the session store garbage collection goroutine.
+// Callers should close g.v2SessionDone when shutting down.
+func (g *Gateway) StartGC() {
+	go g.v2Sessions.gcPeriodic(1*time.Minute, g.v2SessionDone)
 }
 
 func (g *Gateway) Handler() http.Handler {
@@ -93,6 +103,7 @@ func (g *Gateway) Handler() http.Handler {
 	mux.HandleFunc("POST /v1/responses", g.authenticate(g.handleInference(wire.Responses)))
 	mux.HandleFunc("POST /v1/messages", g.authenticate(g.handleInference(wire.Anthropic)))
 	mux.HandleFunc("POST /v1/systemone", g.authenticate(g.handleSystemOne))
+	mux.HandleFunc("POST /v1/chat/completions/tool_results", g.authenticate(g.handleV2ToolResults))
 	mux.HandleFunc("GET /healthz", g.handleHealth)
 	return telemetry.Recover(g.logger, mux)
 }
@@ -542,6 +553,126 @@ func writeSSEData(w http.ResponseWriter, streamID string, created int64, model s
 func jsonMarshal(v any) []byte {
 	b, _ := json.Marshal(v)
 	return b
+}
+
+// writeV2Response formats a V2 response for the client.
+// Used by handleV2Inference and handleV2ToolResults.
+func (g *Gateway) writeV2Response(w http.ResponseWriter, stream bool, model string, resp *v2.V2Response, requestID string) {
+	created := time.Now().Unix()
+
+	if stream {
+		w.Header().Set("Content-Type", "text/event-stream; charset=utf-8")
+		w.Header().Set("Cache-Control", "no-cache")
+		w.Header().Set("X-Accel-Buffering", "no")
+		w.WriteHeader(http.StatusOK)
+
+		streamID := fmt.Sprintf("chatcmpl-%s", requestID)
+
+		// Role chunk
+		writeSSEChunk(w, streamID, created, model, map[string]any{"role": "assistant"}, nil, false)
+
+		// Text chunks (20 chars each)
+		if resp.Text != "" {
+			for i := 0; i < len(resp.Text); i += 20 {
+				end := i + 20
+				if end > len(resp.Text) {
+					end = len(resp.Text)
+				}
+				chunk := resp.Text[i:end]
+				isLast := end >= len(resp.Text)
+				finishReason := map[string]any{"finish_reason": nil}
+				if isLast {
+					finishReason = map[string]any{"finish_reason": "stop"}
+				}
+				writeSSEChunk(w, streamID, created, model, map[string]any{"content": chunk}, finishReason, isLast)
+			}
+		}
+
+		// Tool call chunks
+		for _, tool := range resp.Tools {
+			toolCall := map[string]any{
+				"id":   tool.ID,
+				"type": "function",
+				"function": map[string]any{
+					"name":      tool.Function.Name,
+					"arguments": string(tool.Function.Arguments),
+				},
+			}
+			writeSSEToolCall(w, streamID, created, model, toolCall, false)
+		}
+
+		// Final chunk
+		finishReason := "stop"
+		if resp.Finish == "tool_calls" {
+			finishReason = "tool_calls"
+		}
+		writeSSEChunk(w, streamID, created, model, nil, map[string]any{"finish_reason": finishReason}, true)
+
+		w.Write([]byte("data: [DONE]\n\n"))
+		if flusher, ok := w.(http.Flusher); ok {
+			flusher.Flush()
+		}
+		return
+	}
+
+	// Non-streaming response
+	response := map[string]any{
+		"id":      fmt.Sprintf("chatcmpl-%s", requestID),
+		"object":  "chat.completion",
+		"created": created,
+		"model":   model,
+	}
+
+	if resp.Finish == "tool_calls" && len(resp.Tools) > 0 {
+		toolCalls := make([]any, 0, len(resp.Tools))
+		for _, tool := range resp.Tools {
+			toolCalls = append(toolCalls, map[string]any{
+				"id":   tool.ID,
+				"type": "function",
+				"function": map[string]any{
+					"name":      tool.Function.Name,
+					"arguments": string(tool.Function.Arguments),
+				},
+			})
+		}
+		response["choices"] = []any{
+			map[string]any{
+				"index": 0,
+				"message": map[string]any{
+					"role":        "assistant",
+					"content":     nil,
+					"tool_calls":  toolCalls,
+					"finish_reason": "tool_calls",
+				},
+			},
+		}
+	} else if resp.Text != "" {
+		response["choices"] = []any{
+			map[string]any{
+				"index": 0,
+				"message": map[string]any{
+					"role":        "assistant",
+					"content":     resp.Text,
+					"finish_reason": "stop",
+				},
+			},
+		}
+	} else {
+		response["choices"] = []any{
+			map[string]any{
+				"index": 0,
+				"message": map[string]any{
+					"role":        "assistant",
+					"content":     nil,
+					"finish_reason": "stop",
+				},
+			},
+		}
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	w.Write(jsonMarshal(response))
 }
 
 // handleSystemOne serves System One decision requests on their own endpoint.
