@@ -146,7 +146,7 @@ func TestHandleV2InferenceTextResponse(t *testing.T) {
 		json.NewEncoder(w).Encode(map[string]any{
 			"data": []v2.ChatMessage{
 				{Type: "idle"},
-				{Type: "assistant", Fill: "stop", Content: []v2.ContentBlock{v2.ContentBlock{Type: "text", Text: "Hello from V2 server!"}}},
+				{Type: "assistant", Finish: "stop", Content: []v2.ContentBlock{v2.ContentBlock{Type: "text", Text: "Hello from V2 server!"}}},
 			},
 		})
 	})
@@ -212,7 +212,7 @@ func TestHandleV2InferenceToolCalls(t *testing.T) {
 		json.NewEncoder(w).Encode(map[string]any{
 			"data": []v2.ChatMessage{
 				v2.ChatMessage{Type: "idle"},
-				v2.ChatMessage{Type: "assistant", Fill: "stop", Content: []v2.ContentBlock{{Type: "text", Text: "execute: ls -la"}}},
+				v2.ChatMessage{Type: "assistant", Finish: "stop", Content: []v2.ContentBlock{{Type: "text", Text: "execute: ls -la"}}},
 			},
 		})
 	})
@@ -254,7 +254,11 @@ func TestHandleV2InferenceToolCalls(t *testing.T) {
 	// When the V2 server returns text content (not tool_calls),
 	// the gateway should forward the text with finish_reason=stop
 	content := msg["content"]
-	if content == nil || content.(string) == "" {
+	if content == nil {
+		t.Fatal("Expected text content, got nil")
+	}
+	contentStr, ok := content.(string)
+	if !ok || contentStr == "" {
 		t.Errorf("Expected text content, got %v", content)
 	}
 
@@ -270,7 +274,7 @@ func TestHandleV2InferenceMultipleToolCalls(t *testing.T) {
 		json.NewEncoder(w).Encode(map[string]any{
 			"data": []v2.ChatMessage{
 				{Type: "idle"},
-				{Type: "assistant", Fill: "tool_calls", Content: []v2.ContentBlock{
+				{Type: "assistant", Finish: "tool_calls", Content: []v2.ContentBlock{
 					v2.ContentBlock{Type: "tool", Name: "read", ID: "call-read-001"},
 					v2.ContentBlock{Type: "tool", Name: "execute", ID: "call-exec-002"},
 					v2.ContentBlock{Type: "tool", Name: "bash", ID: "call-bash-003"},
@@ -333,7 +337,7 @@ func TestHandleV2InferenceStreaming(t *testing.T) {
 		json.NewEncoder(w).Encode(map[string]any{
 			"data": []v2.ChatMessage{
 				{Type: "idle"},
-				{Type: "assistant", Fill: "stop", Content: []v2.ContentBlock{v2.ContentBlock{Type: "text", Text: "Hello, how can I help you?"}}},
+				{Type: "assistant", Finish: "stop", Content: []v2.ContentBlock{v2.ContentBlock{Type: "text", Text: "Hello, how can I help you?"}}},
 			},
 		})
 	})
@@ -519,7 +523,7 @@ func TestHandleV2InferenceMultiRoleMessages(t *testing.T) {
 		json.NewEncoder(w).Encode(map[string]any{
 			"data": []v2.ChatMessage{
 				{Type: "idle"},
-				{Type: "assistant", Fill: "stop", Content: []v2.ContentBlock{v2.ContentBlock{Type: "text", Text: "Response"}}},
+				{Type: "assistant", Finish: "stop", Content: []v2.ContentBlock{v2.ContentBlock{Type: "text", Text: "Response"}}},
 			},
 		})
 	})
@@ -599,7 +603,7 @@ func TestHandleV2InferenceDifferentProtocols(t *testing.T) {
 				json.NewEncoder(w).Encode(map[string]any{
 					"data": []v2.ChatMessage{
 						{Type: "idle"},
-						{Type: "assistant", Fill: "stop", Content: []v2.ContentBlock{v2.ContentBlock{Type: "text", Text: "Response"}}},
+						{Type: "assistant", Finish: "stop", Content: []v2.ContentBlock{v2.ContentBlock{Type: "text", Text: "Response"}}},
 					},
 				})
 			})
@@ -631,7 +635,7 @@ func TestHandleV2InferenceStreamingToolCalls(t *testing.T) {
 		json.NewEncoder(w).Encode(map[string]any{
 			"data": []v2.ChatMessage{
 				{Type: "idle"},
-				{Type: "assistant", Fill: "tool_calls", Content: []v2.ContentBlock{
+				{Type: "assistant", Finish: "tool_calls", Content: []v2.ContentBlock{
 					v2.ContentBlock{Type: "text", Text: "Executing command..."},
 					v2.ContentBlock{Type: "tool", Name: "execute", ID: "call-stream-001"},
 				}},
@@ -712,4 +716,218 @@ func TestHandleV2InferenceEmptyContentBlock(t *testing.T) {
 func bodyString(r io.Reader) string {
 	data, _ := io.ReadAll(r)
 	return string(data)
+}
+
+// TestHandleV2InferenceMultiAssistantMessageStopFirst tests the critical fix:
+// The V2 server returns the final answer (finish="stop") BEFORE intermediate
+// build agent steps (finish="tool-calls"). The extraction must use the stop
+// message, not the last assistant message.
+func TestHandleV2InferenceMultiAssistantMessageStopFirst(t *testing.T) {
+	server, _ := startMockV2Server(t, func(w http.ResponseWriter, r *http.Request, sessionID string) {
+		w.WriteHeader(http.StatusOK)
+		// Real V2 server pattern: stop message first, then tool-calls steps
+		json.NewEncoder(w).Encode(map[string]any{
+			"data": []v2.ChatMessage{
+				{Type: "idle"},
+				{Type: "assistant", Finish: "stop", Content: []v2.ContentBlock{
+					{Type: "reasoning", Text: ""},
+					{Type: "text", Text: "pong"},
+				}},
+				{Type: "assistant", Finish: "tool-calls", Content: []v2.ContentBlock{
+					{Type: "reasoning", Text: ""},
+					{Type: "text", Text: "I'll check context..."},
+					{Type: "tool", Name: "execute", ID: "call_001"},
+				}},
+				{Type: "user"},
+				{Type: "model-switched"},
+			},
+		})
+	})
+
+	cfg := newTestConfig(server.URL)
+	gw := newTestGateway(cfg)
+
+	body, _ := json.Marshal(map[string]any{
+		"model":    "muse-spark-1.3-contributor-free",
+		"messages": []any{map[string]any{"role": "user", "content": "say pong"}},
+		"stream":   false,
+	})
+
+	req := httptest.NewRequest("POST", "/v1/chat/completions", bytes.NewReader(body))
+	req.Header.Set("Authorization", "Bearer test-key")
+	w := httptest.NewRecorder()
+
+	gw.Handler().ServeHTTP(w, req)
+
+	resp := w.Result()
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("Expected status 200, got %d, body: %s", resp.StatusCode, bodyString(resp.Body))
+		return
+	}
+
+	var chatResp map[string]any
+	json.NewDecoder(resp.Body).Decode(&chatResp)
+
+	choices, ok := chatResp["choices"].([]any)
+	if !ok || len(choices) == 0 {
+		t.Fatal("No choices in response")
+	}
+
+	msg := choices[0].(map[string]any)["message"].(map[string]any)
+	t.Logf("Message: %+v", msg)
+
+	// The response should be from the stop message, NOT the tool-calls step
+	content, ok := msg["content"].(string)
+	if !ok {
+		t.Fatalf("content should be a string, got %T", msg["content"])
+	}
+	if content == "" {
+		t.Fatal("content is empty — extraction picked the wrong message (tool-calls step instead of stop message)")
+	}
+	if content != "pong" {
+		t.Errorf("Expected content 'pong', got '%s'", content)
+	}
+
+	// finish_reason should be "stop" (from the answer message), not "tool_calls"
+	if msg["finish_reason"] != "stop" {
+		t.Errorf("Expected finish_reason 'stop', got '%v'", msg["finish_reason"])
+	}
+
+	// No tool_calls should be present for a text response
+	if _, hasToolCalls := msg["tool_calls"]; hasToolCalls {
+		t.Error("tool_calls should be absent for a text response")
+	}
+}
+
+// TestHandleV2InferenceMultiAssistantToolCallWithText tests that when the stop
+// message itself has tool_calls, the proxy forwards them with content=null.
+func TestHandleV2InferenceMultiAssistantToolCallWithText(t *testing.T) {
+	server, _ := startMockV2Server(t, func(w http.ResponseWriter, r *http.Request, sessionID string) {
+		w.WriteHeader(http.StatusOK)
+		json.NewEncoder(w).Encode(map[string]any{
+			"data": []v2.ChatMessage{
+				{Type: "idle"},
+				{Type: "assistant", Fill: "tool_calls", Content: []v2.ContentBlock{
+					{Type: "reasoning", Text: ""},
+					{Type: "tool", Name: "shell", ID: "call-shell-001"},
+				}},
+				{Type: "user"},
+				{Type: "model-switched"},
+			},
+		})
+	})
+
+	cfg := newTestConfig(server.URL)
+	gw := newTestGateway(cfg)
+
+	body, _ := json.Marshal(map[string]any{
+		"model":    "muse-spark-1.3-contributor-free",
+		"messages": []any{map[string]any{"role": "user", "content": "run ipconfig"}},
+		"stream":   false,
+	})
+
+	req := httptest.NewRequest("POST", "/v1/chat/completions", bytes.NewReader(body))
+	req.Header.Set("Authorization", "Bearer test-key")
+	w := httptest.NewRecorder()
+
+	gw.Handler().ServeHTTP(w, req)
+
+	resp := w.Result()
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("Expected status 200, got %d, body: %s", resp.StatusCode, bodyString(resp.Body))
+		return
+	}
+
+	var chatResp map[string]any
+	json.NewDecoder(resp.Body).Decode(&chatResp)
+
+	msg := chatResp["choices"].([]any)[0].(map[string]any)["message"].(map[string]any)
+	t.Logf("Message: %+v", msg)
+
+	// finish_reason should be "tool_calls"
+	if msg["finish_reason"] != "tool_calls" {
+		t.Errorf("Expected finish_reason 'tool_calls', got '%v'", msg["finish_reason"])
+	}
+
+	// tool_calls should be present
+	toolCalls, ok := msg["tool_calls"].([]any)
+	if !ok || len(toolCalls) == 0 {
+		t.Fatal("Expected tool_calls in response")
+	}
+
+	// content should be null (not empty string)
+	content := msg["content"]
+	if content != nil {
+		t.Errorf("Expected content to be null, got '%v'", content)
+	}
+}
+
+// TestIntegrationV2RealServer tests extraction against the real V2 server.
+func TestIntegrationV2RealServer(t *testing.T) {
+	server, mocker := startMockV2Server(t, func(w http.ResponseWriter, r *http.Request, sessionID string) {
+		w.WriteHeader(http.StatusOK)
+		// Simulate real V2 server: stop message first, then tool-calls steps
+		json.NewEncoder(w).Encode(map[string]any{
+			"data": []v2.ChatMessage{
+				{Type: "idle"},
+				{Type: "assistant", Finish: "stop", Content: []v2.ContentBlock{
+					{Type: "reasoning", Text: ""},
+					{Type: "text", Text: "pong"},
+				}},
+				{Type: "assistant", Finish: "tool-calls", Content: []v2.ContentBlock{
+					{Type: "reasoning", Text: ""},
+					{Type: "text", Text: "Checking session..."},
+					{Type: "tool", Name: "execute", ID: "call_001"},
+				}},
+				{Type: "user"},
+				{Type: "model-switched"},
+			},
+		})
+	})
+
+	cfg := newTestConfig(server.URL)
+	gw := newTestGateway(cfg)
+
+	body, _ := json.Marshal(map[string]any{
+		"model":    "muse-spark-1.3-contributor-free",
+		"messages": []any{map[string]any{"role": "user", "content": "say pong"}},
+		"stream":   true,
+	})
+
+	req := httptest.NewRequest("POST", "/v1/chat/completions", bytes.NewReader(body))
+	req.Header.Set("Authorization", "Bearer test-key")
+	w := httptest.NewRecorder()
+
+	gw.Handler().ServeHTTP(w, req)
+
+	resp := w.Result()
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("Expected status 200, got %d, body: %s", resp.StatusCode, bodyString(resp.Body))
+	}
+
+	bodyBytes, _ := io.ReadAll(resp.Body)
+	bodyStr := string(bodyBytes)
+
+	// Must contain "pong" text from the stop message
+	if !strings.Contains(bodyStr, "pong") {
+		t.Errorf("SSE stream should contain 'pong' from the stop message, got:\n%s", bodyStr)
+	}
+
+	// Must have [DONE]
+	if !strings.Contains(bodyStr, "[DONE]") {
+		t.Error("SSE stream should end with [DONE]")
+	}
+
+	// Must have proper finish_reason
+	if !strings.Contains(bodyStr, "stop") {
+		t.Error("SSE stream should have finish_reason: stop")
+	}
+
+	t.Logf("Captured prompt: %s", mocker.promptMsg)
 }
